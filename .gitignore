@@ -1,0 +1,122 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+*.env
+!.env.example
+
+# === API Keys Backup (CRITICAL) ===
+api_keys_backup.txt
+
+# === Data & Results (ALL excluded) ===
+*.xlsx
+*.xls
+*.csv
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.html
+*.txt
+!requirements.txt
+*.json
+!account_classification.json
+
+# Data directories
+finfraud_crawler/
+finfraud_processing/data/raw/
+finfraud_processing/data/edgar_reports_text/
+finfraud_processing/data/cache/
+finfraud_processing/data/validation/
+finfraud_processing/data/processed/cases/case_*.json
+finfraud_processing/data/processed/cases/*.png
+finfraud_processing/data/processed/cases/all_accounts_freq.json
+LLM-FinRisk/LLM-FinRisk/data/
+LLM-FinRisk/LLM-FinRisk/results/*.xlsx
+LLM-FinRisk/LLM-FinRisk/logs/
+LLM-FinRisk/LLM-FinRisk/demo/
+llm_risk_backup/
+experiment_platform/
+us_pipeline_v2/results/*.xlsx
+us_pipeline_v2/reports/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temp files
+~$*.xlsx
+*.tmp
+*.temp
+
+# Debug / Design artifacts
+_method_debug.txt
+*design.md
+conclusion.md
+paper_pages_6_9.txt
+paper.pdf
+
+# Excluded directories (not needed for core pipelines)
+finfraud_processing/step*.py
+finfraud_processing/config.py
+finfraud_processing/data_schema.py
+finfraud_processing/prompt_templates.py
+finfraud_processing/utils/
+finfraud_processing/data_schema_cn_extension/
+finfraud_processing/requirements.txt
+finfraud_processing/__init__.py
+finfraud_processing/logs/
+INFORMS-ISRE-Template-6-10-2024/
+paper/
+scripts/
+logs/
+
+# Excluded root scripts
+run_agent.py
+run_agent_negative_sample.py
+run_agent_nfp.py
+run_single_llm.py
+run_accounting_eval_all.py
+gemini.py
+gen_table1.py
+show_eval_agent_raw.py
+show_eval_details.py
+verify_eval_fix.py
+verify_eval_new.py
+fix_excel.py
+reprocess_all.py
+111.py
+run_all.bat
+sampled_files.txt
+table1_overall.tex
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb

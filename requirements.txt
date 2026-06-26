@@ -1,0 +1,29 @@
+# ============================================================
+# AuditAgent — Cross-Regulatory AI-Augmented Financial Fraud
+#              Evidence Discovery System
+# ============================================================
+# Core dependencies for US Pipeline V2 and CN Pipeline.
+
+# Async HTTP
+aiohttp>=3.8.0
+
+# Data handling
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Token counting
+tiktoken>=0.5.0
+
+# LLM API (OpenAI-compatible: DeepSeek, MiniMax, Volces ARK)
+openai>=1.0.0
+requests>=2.28.0
+
+# US Pipeline V2 — retrieval
+rank_bm25>=0.2.0
+sentence-transformers>=2.2.0
+
+# CN Pipeline — PDF parsing
+PyMuPDF>=1.22.0
+
+# Optional: plotting (us_pipeline_v2/plot.py)
+matplotlib>=3.7.0
