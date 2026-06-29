@@ -9,6 +9,44 @@ import aiohttp
 import tiktoken
 
 ENCODING_NAME = "cl100k_base"
+
+
+# ============================================================
+# Failure handling: distinguish "API failed" from "model said empty"
+# ============================================================
+class TerminalAPIError(Exception):
+    """Non-retryable API error (insufficient balance / quota / auth)."""
+
+
+class CallFailedError(Exception):
+    """LLM call failed after exhausting retries (transient)."""
+
+
+# Lazily-created circuit breaker, shared by every agent in this process. Tripped
+# by the first terminal error so subsequent calls fail fast instead of burning
+# the remaining quota/cases.
+STOP_EVENT: "asyncio.Event | None" = None
+
+_TERMINAL_ERROR_KEYWORDS = (
+    "insufficient balance", "insufficient_quota", "insufficient quota",
+    "exceeded your current quota", "account balance", "billing", "arrears",
+    "余额不足", "余额", "配额", "欠费", "账户", "已用尽", "quota exceeded",
+)
+
+
+def _is_terminal_error(status: int, body: str) -> bool:
+    """True if an HTTP status / body signals a non-retryable billing/quota/auth error."""
+    if status in (401, 402, 403):
+        return True
+    low = (body or "").lower()
+    return any(kw in low for kw in _TERMINAL_ERROR_KEYWORDS)
+
+
+def stop_requested() -> bool:
+    """Whether the circuit breaker has been tripped by a terminal API error."""
+    return STOP_EVENT is not None and STOP_EVENT.is_set()
+
+
 # TODO: Set your API keys via environment variables before running.
 # Original keys backed up in api_keys_backup.txt (EXCLUDED from git).
 API_CONFIGS = {
@@ -115,10 +153,17 @@ class BaseAgent:
         track_phase: str = "",
         response_format: dict | None = None,
     ) -> str:
+        global STOP_EVENT
+        if STOP_EVENT is None:
+            STOP_EVENT = asyncio.Event()
+        if STOP_EVENT.is_set():
+            raise TerminalAPIError("global stop already triggered by an earlier terminal error")
+
         api_cfg = API_CONFIGS.get(self.model_name, API_CONFIGS["minimax-m2.5"])
         model_cfg = MODEL_CONFIGS.get(self.model_name, MODEL_CONFIGS["minimax-m2.5"])
         truncated = truncate_by_tokens(prompt, 60000)
 
+        last_err = ""
         for attempt in range(self.max_retries + 1):
             try:
                 payload = {
@@ -142,17 +187,45 @@ class BaseAgent:
                     json=payload,
                 ) as resp:
                     if resp.status == 429:
+                        # 429 is usually rate limiting, but several providers also
+                        # return it for quota/billing exhaustion — so read the body
+                        # and treat that as terminal instead of retrying forever.
+                        text = await resp.text()
+                        if _is_terminal_error(429, text):
+                            STOP_EVENT.set()
+                            raise TerminalAPIError(f"HTTP 429 (quota/billing): {text[:200]}")
                         wait = min(300, (2 ** attempt) * 5)
-                        logging.warning(f"429 — waiting {wait}s (attempt {attempt + 1})")
-                        await asyncio.sleep(wait)
-                        continue
-                    data = await resp.json()
-                    if "error" in data:
-                        logging.error(f"API error: {data['error']}")
+                        logging.warning(f"429 rate limit — waiting {wait}s "
+                                        f"(attempt {attempt + 1}): {text[:150]}")
+                        last_err = f"HTTP 429: {text[:200]}"
+                        if attempt < self.max_retries:
+                            await asyncio.sleep(wait)
+                            continue
+                        raise CallFailedError(last_err)
+                    if resp.status != 200:
+                        text = await resp.text()
+                        if _is_terminal_error(resp.status, text):
+                            STOP_EVENT.set()
+                            raise TerminalAPIError(f"HTTP {resp.status}: {text[:200]}")
+                        last_err = f"HTTP {resp.status}: {text[:200]}"
+                        logging.warning(f"{last_err} (attempt {attempt + 1})")
                         if attempt < self.max_retries:
                             await asyncio.sleep(2 ** attempt)
                             continue
-                        return ""
+                        raise CallFailedError(last_err)
+
+                    data = await resp.json()
+                    if "error" in data:
+                        err = json.dumps(data["error"], ensure_ascii=False)
+                        if _is_terminal_error(200, err):
+                            STOP_EVENT.set()
+                            raise TerminalAPIError(err[:200])
+                        logging.error(f"API error: {data['error']}")
+                        last_err = err[:200]
+                        if attempt < self.max_retries:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        raise CallFailedError(last_err)
 
                     # Track actual API token usage
                     if track_phase:
@@ -165,6 +238,7 @@ class BaseAgent:
 
                     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                     if not content:
+                        # Genuinely empty model output (not a failure) — preserved as "".
                         logging.warning(f"LLM returned empty content (attempt {attempt + 1})")
                         return content
 
@@ -173,13 +247,16 @@ class BaseAgent:
                     if think_end != -1:
                         content = content[think_end + 8:].strip()
                     return content
+            except (TerminalAPIError, CallFailedError):
+                raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logging.error(f"HTTP error (attempt {attempt + 1}): {e}")
+                last_err = str(e)
                 if attempt < self.max_retries:
                     await asyncio.sleep(min(60, 2 ** attempt))
                 else:
-                    return ""
-        return ""
+                    raise CallFailedError(last_err)
+        raise CallFailedError(last_err or "unknown error")
 
     @staticmethod
     def _repair_json(text: str) -> str:
