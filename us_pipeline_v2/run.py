@@ -61,6 +61,19 @@ AIOHTTP_POOL_PER_HOST = 300      # per-host connection limit
 FLUSH_INTERVAL_SEC = 30         # auto-flush Excel every N seconds
 FLUSH_BATCH_SIZE = 50           # auto-flush Excel every N cases
 
+# ---- Circuit breaker: tripped by the first terminal (no-balance/quota/auth) error ----
+_US_STOP: "asyncio.Event | None" = None
+
+
+def _request_stop() -> None:
+    """Trip the run-level circuit breaker (no new cases will be started)."""
+    if _US_STOP is not None:
+        _US_STOP.set()
+
+
+def _stop_requested() -> bool:
+    return _US_STOP is not None and _US_STOP.is_set()
+
 # ---- Sheet schemas ----
 SHEET1_COLUMNS = [
     "Id", "CaseId", "CompanyName", "InputPath", "ReportCount",
@@ -405,9 +418,19 @@ async def process_case(
             print(f"    Retrieval: {stats.get('subjects_with_hits', '?')}/{stats.get('n_subjects', '?')} "
                   f"subjects hit, {stats.get('total_passages', '?')} passages")
     except Exception as e:
-        print(f"    Pipeline ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        # Any failure leaves result_str=None → the case is NOT saved below → the
+        # next run retries it (a flaky/exhausted API never freezes in as an empty
+        # "success" that resume would skip). Detect a terminal billing/quota/auth
+        # error by class name (base_agent is imported under two module paths here,
+        # so isinstance against either import is unreliable) and stop the run.
+        if type(e).__name__ == "TerminalAPIError":
+            _request_stop()
+            print(f"    [STOP] Terminal API error (no balance / quota / auth) — "
+                  f"case NOT saved, run is stopping: {e}")
+        else:
+            print(f"    [RETRY] Pipeline error — case NOT saved, will be retried next run: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Save Agent result to Sheet1 (in-memory, fast)
     sheet1_id = 0
@@ -704,6 +727,10 @@ async def main() -> None:
     eval_sem = asyncio.Semaphore(LLM_CONCURRENCY)
     io_sem = asyncio.Semaphore(args.io_concurrency)
 
+    # ---- Circuit breaker (tripped by the first terminal API error) ----
+    global _US_STOP
+    _US_STOP = asyncio.Event()
+
     try:
         if args.reeval_only:
             # ---- Re-eval mode ----
@@ -764,6 +791,9 @@ async def main() -> None:
         async with aiohttp.ClientSession(connector=connector) as session:
             async def run_one(case, idx):
                 async with case_sem:
+                    # Stop pulling new cases once a terminal error tripped the breaker.
+                    if _stop_requested():
+                        return None
                     print(f"\n[{idx + 1}/{len(unprocessed)}] Processing {case['CaseId']}")
                     paths = [p.strip() for p in str(case["InputPath"]).split(";") if p.strip()]
                     return await process_case(
@@ -776,6 +806,12 @@ async def main() -> None:
             results = await asyncio.gather(*tasks)
 
         processed = sum(1 for r in results if r)
+        if _stop_requested():
+            print("\n" + "=" * 80)
+            print("STOPPED EARLY: terminal API error (no balance / quota / auth).")
+            print("Finished cases are saved; unfinished ones were NOT saved — top up the")
+            print("account and re-run the same command to resume from where it stopped.")
+            print("=" * 80)
         print(f"\nPipeline complete: {processed}/{len(unprocessed)} cases processed")
 
         await writer.write_summary()

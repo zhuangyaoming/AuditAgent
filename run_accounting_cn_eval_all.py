@@ -12,8 +12,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 import aiohttp
@@ -47,6 +49,45 @@ SEPARATOR = "\n next \n"
 CONCURRENCY_LIMIT = 1
 MAX_RETRIES = 5
 DEFAULT_SYSTEM_ROLE = "你是一个财务审计专家。"
+
+# ============================================================
+# Failure handling: distinguish "API failed" from "model said empty"
+# ============================================================
+# Two failure classes so a flaky/exhausted API never gets silently saved as a
+# successful (empty) result:
+#   - TerminalAPIError: non-retryable (no balance / quota / auth). Triggers a
+#     global stop so we don't keep burning failed calls across remaining cases.
+#   - CallFailedError: transient failure that survived all retries. The case is
+#     NOT saved, so the next run picks it up again instead of skipping it.
+
+class TerminalAPIError(Exception):
+    """Non-retryable API error (insufficient balance / quota / auth)."""
+
+
+class CallFailedError(Exception):
+    """LLM call failed after exhausting retries (transient)."""
+
+
+# Global circuit breaker. Created in main(); set when a terminal error is seen.
+STOP_EVENT: "asyncio.Event | None" = None
+
+# Substrings that indicate a terminal billing/quota/auth problem (case-insensitive;
+# Chinese terms are matched as-is).
+_TERMINAL_ERROR_KEYWORDS = (
+    "insufficient balance", "insufficient_quota", "insufficient quota",
+    "exceeded your current quota", "account balance", "billing", "arrears",
+    "余额不足", "余额", "配额", "欠费", "账户", "已用尽", "quota exceeded",
+)
+
+
+def _is_terminal_error(status: int, body: str) -> bool:
+    """Return True if an HTTP status / response body signals a non-retryable
+    billing / quota / auth error."""
+    if status in (401, 402, 403):
+        return True
+    low = (body or "").lower()
+    return any(kw in low for kw in _TERMINAL_ERROR_KEYWORDS)
+
 
 DATASET_XLSX = Path(r"d:\mainfiles\AuditAgent\LLM-FinRisk\LLM-FinRisk\data\dataset\FinFraud-dataset-txt-cross.xlsx")
 TXT_PREFIX = Path(r"d:\mainfiles\AuditAgent\llm_risk_backup\llm-financial-risk\dataset\financial-report-context-txt")
@@ -403,10 +444,18 @@ class CnAgentRunner:
                           track_phase: str = "") -> str:
         """Async API call with retry logic.
 
-        Args:
-            track_phase: If set, accumulates actual API token usage into
-                         token_usage[track_phase].
+        Raises:
+            TerminalAPIError: non-retryable billing/quota/auth error. Also trips
+                the global STOP_EVENT so the remaining cases stop quickly.
+            CallFailedError: transient error that survived all retries.
+
+        A returned "" now means only that the model genuinely produced empty
+        content — never that the call failed — so callers can safely persist
+        real results without poisoning resume.
         """
+        if STOP_EVENT is not None and STOP_EVENT.is_set():
+            raise TerminalAPIError("global stop already triggered by an earlier terminal error")
+
         config = API_CONFIGS[self.model_name]
         model = MODEL_CONFIGS[self.model_name]["model"]
         payload = {
@@ -419,6 +468,7 @@ class CnAgentRunner:
             "top_p": 0.9,
         }
 
+        last_err = ""
         for attempt in range(MAX_RETRIES):
             try:
                 async with self.session.post(
@@ -429,12 +479,32 @@ class CnAgentRunner:
                 ) as resp:
                     if resp.status != 200:
                         text = await resp.text()
-                        logging.warning(f"HTTP {resp.status} (attempt {attempt+1}): {text[:200]}")
+                        if _is_terminal_error(resp.status, text):
+                            if STOP_EVENT is not None:
+                                STOP_EVENT.set()
+                            raise TerminalAPIError(f"HTTP {resp.status}: {text[:200]}")
+                        last_err = f"HTTP {resp.status}: {text[:200]}"
+                        logging.warning(f"{last_err} (attempt {attempt+1}/{MAX_RETRIES})")
                         if attempt < MAX_RETRIES - 1:
                             await asyncio.sleep(5 * (attempt + 1))
                             continue
-                        return ""
+                        raise CallFailedError(last_err)
+
                     data = await resp.json()
+
+                    # Some providers return HTTP 200 with an error payload.
+                    if isinstance(data, dict) and data.get("error"):
+                        err = json.dumps(data["error"], ensure_ascii=False)
+                        if _is_terminal_error(200, err):
+                            if STOP_EVENT is not None:
+                                STOP_EVENT.set()
+                            raise TerminalAPIError(err[:200])
+                        last_err = err[:200]
+                        logging.warning(f"API error payload (attempt {attempt+1}/{MAX_RETRIES}): {last_err}")
+                        if attempt < MAX_RETRIES - 1:
+                            await asyncio.sleep(5 * (attempt + 1))
+                            continue
+                        raise CallFailedError(last_err)
 
                     # Track actual API token usage
                     if track_phase:
@@ -451,13 +521,16 @@ class CnAgentRunner:
                     if think_end != -1:
                         content = content[think_end + 8:].strip()
                     return content
+            except (TerminalAPIError, CallFailedError):
+                raise
             except Exception as e:
-                logging.warning(f"API error (attempt {attempt+1}): {e}")
+                last_err = str(e)
+                logging.warning(f"API error (attempt {attempt+1}/{MAX_RETRIES}): {e}")
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(5 * (attempt + 1))
                     continue
-                return ""
-        return ""
+                raise CallFailedError(last_err)
+        raise CallFailedError(last_err or "unknown error")
 
     @staticmethod
     def _extract_json(text: str) -> str | None:
@@ -603,14 +676,20 @@ class CnAgentRunner:
 
         tasks_futures = [asyncio.create_task(process_task(t)) for t in all_tasks]
         results = []
-        for future in asyncio.as_completed(tasks_futures):
-            try:
+        # Any unrecovered failure (terminal or transient) aborts the whole case so
+        # it is NOT saved as a half-empty success. Cancel the still-running siblings
+        # first to avoid wasting their tokens, then re-raise for process_case().
+        try:
+            for future in asyncio.as_completed(tasks_futures):
                 result = await future
                 results.append(result)
                 print(f"    [{len(results)}/{len(all_tasks)}] {result[0]}:{result[1][:40] if result[1] else '?'}")
                 logging.info(f"处理进度 {len(results)}/{len(all_tasks)}")
-            except Exception as e:
-                logging.error(f"Task error: {e}")
+        except BaseException:
+            for f in tasks_futures:
+                if not f.done():
+                    f.cancel()
+            raise
 
         # Merge results
         merge_trend_content = "\n\n".join(
@@ -675,14 +754,50 @@ class CnAgentRunner:
 # ============================================================
 
 def _write_sheet(excel_path: Path, sheet_name: str, df: pd.DataFrame):
-    """Write or update a sheet in the Excel file."""
+    """Write or update a sheet, crash-safely.
+
+    Old behaviour rewrote the workbook in place (``mode="a"``): if the process was
+    killed mid-write (e.g. you Ctrl-C after the API runs out), the whole .xlsx
+    could be truncated and every previously-saved case lost. This version reads
+    the existing sheets, overlays the target one, writes everything to a temp file
+    in the same directory, then atomically ``os.replace``s it onto the target — so
+    a crash leaves either the old file or the new file intact, never a corrupt one.
+    """
     xl_path = Path(excel_path)
+    xl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Preserve any sibling sheets (Sheet1 / Eval_Metrics / Eval_Process).
+    sheets: dict[str, pd.DataFrame] = {}
     if xl_path.exists():
-        with pd.ExcelWriter(xl_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-    else:
-        with pd.ExcelWriter(xl_path, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+        try:
+            sheets = pd.read_excel(xl_path, sheet_name=None)
+        except Exception as e:
+            # The file exists but is unreadable right now (open in Excel, transient
+            # lock, or genuine corruption). Refuse to overwrite — rebuilding from a
+            # single sheet here would wipe the sibling sheets and every row we can't
+            # see. Abort the write so the caller treats it as a failure and retries;
+            # the existing file is left untouched.
+            raise RuntimeError(
+                f"_write_sheet: refusing to overwrite unreadable {xl_path.name} ({e}); "
+                f"existing data left intact, case will be retried"
+            ) from e
+    sheets[sheet_name] = df
+
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        suffix=".xlsx", dir=str(xl_path.parent), prefix=".cn_tmp_"
+    )
+    os.close(tmp_fd)
+    try:
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            for name, sdf in sheets.items():
+                sdf.to_excel(writer, sheet_name=name, index=False)
+        os.replace(tmp_path, xl_path)  # atomic on the same filesystem
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 async def save_agent_result(excel_path: Path, case_data: dict, xlsx_lock: asyncio.Lock) -> int:
@@ -888,7 +1003,10 @@ async def process_case(case: dict, model_name: str, prior: str, xlsx_lock: async
     n_gt_evidence = sum(1 for loc in gt["fraud_locations"] if loc.get("evidence") and len(loc["evidence"]) >= 5)
     print(f"    GT: {n_gt_dedup} dedup issues, {n_gt_evidence} evidence entries")
 
-    # Run Agent
+    # Run Agent.
+    # On ANY failure we return without saving, so the case stays out of Sheet1 and
+    # the next run retries it — a flaky/exhausted API never gets frozen in as an
+    # empty "success" that resume would skip forever.
     result_str = None
     report_count = 1
     token_stats: dict[str, int] = {}
@@ -903,13 +1021,26 @@ async def process_case(case: dict, model_name: str, prior: str, xlsx_lock: async
         print(f"    Agent: is_risk={is_risk}, risk_facts={n_facts}")
         if token_stats:
             print(f"    Tokens: {token_stats}")
+    except TerminalAPIError as e:
+        print(f"    [STOP] Terminal API error (no balance / quota / auth) — "
+              f"case NOT saved, run is stopping: {e}")
+        return None
+    except CallFailedError as e:
+        print(f"    [RETRY] Agent call failed after retries — case NOT saved, "
+              f"will be retried next run: {e}")
+        return None
     except Exception as e:
-        print(f"    Agent ERROR: {e}")
+        print(f"    [RETRY] Agent error — case NOT saved, will be retried next run: {e}")
         import traceback
         traceback.print_exc()
+        return None
 
-    # Save Agent result immediately
-    if result_str:
+    if not result_str:
+        return None
+
+    # Reached only on a genuine agent result → safe to persist (atomic write).
+    sheet1_id = 0
+    try:
         agent_data = {
             "CaseId": case_id,
             "CompanyName": company,
@@ -921,9 +1052,8 @@ async def process_case(case: dict, model_name: str, prior: str, xlsx_lock: async
         }
         sheet1_id = await save_agent_result(AUDIT_RESULT_PATH, agent_data, xlsx_lock)
         print(f"    Agent result saved to Sheet1 (row Id={sheet1_id})")
-
-    # Evaluate with LLM Judge
-    if not result_str:
+    except Exception as e:
+        print(f"    [RETRY] Save failed — case NOT marked done, will be retried next run: {e}")
         return None
 
     try:
@@ -1064,6 +1194,10 @@ async def main():
     reeval_only = args.reeval_only
     model_name = args.model
     prior = args.prior
+
+    # Circuit breaker: tripped by the first terminal (no-balance/quota/auth) error.
+    global STOP_EVENT
+    STOP_EVENT = asyncio.Event()
 
     # Build output path: append model name + prior suffix
     global AUDIT_RESULT_PATH
@@ -1271,6 +1405,10 @@ async def main():
     async with aiohttp.ClientSession() as session:
         async def run_one(case, idx):
             async with case_sem:
+                # If a terminal API error already tripped the breaker, stop pulling
+                # new cases instead of hammering a dead/empty quota.
+                if STOP_EVENT is not None and STOP_EVENT.is_set():
+                    return None
                 print(f"\n[{idx+1}/{len(unprocessed)}] Processing CN-{case['case_id']}")
                 result = await process_case(case, model_name, prior, xlsx_lock, session, llm_sem, df_dataset)
                 if result:
@@ -1281,8 +1419,14 @@ async def main():
         results = await asyncio.gather(*tasks)
         processed_count = sum(1 for r in results if r)
 
+    stopped = STOP_EVENT is not None and STOP_EVENT.is_set()
+
     # Final summary
     print(f"\n{'='*80}")
+    if stopped:
+        print("STOPPED EARLY: terminal API error (no balance / quota / auth).")
+        print("Already-finished cases are saved; unfinished ones were NOT saved —")
+        print("top up the account and re-run the same command to resume from where it stopped.")
     print(f"DONE: Processed {processed_count} new cases")
     if AUDIT_RESULT_PATH.exists():
         df_final = pd.read_excel(AUDIT_RESULT_PATH, sheet_name="Sheet1")
